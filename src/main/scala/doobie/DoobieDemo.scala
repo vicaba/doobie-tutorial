@@ -1,19 +1,21 @@
 package doobie
 
-import cats.effect.IOApp
-import cats.effect.ExitCode
-import cats.effect.IO
+import cats.effect.*
+import cats.implicits.*
 
+import doobie.*
 import doobie.implicits.*
+import doobie.postgres.*
+import doobie.postgres.implicits.*
+import java.util.UUID
 
 // Left video at 29:00
 
 object DoobieDemo extends IOApp:
-
   case class Actor(id: Int, name: String)
 
   case class Movie(
-    id: String,
+    id: UUID,
     title: String,
     year: Int,
     actors: List[String],
@@ -21,8 +23,7 @@ object DoobieDemo extends IOApp:
   )
 
   extension [A](io: IO[A])
-
-    def myDebug(): IO[A] = io.map { v =>
+    def myDebug: IO[A] = io.map { v =>
       println(s"[${Thread.currentThread().getName()}] $v")
       v
     }
@@ -77,5 +78,93 @@ object DoobieDemo extends IOApp:
     val query = sql"insert into actors (name) values ($name)"
     query.update.withUniqueGeneratedKeys[Int]("id").transact(xa)
 
+  // Update/Insert many
+  def saveMultipleActors(actorNames: List[String]): IO[List[Actor]] =
+    val insertStatement = "insert into actors (name) values (?)"
+    val updateAction =
+      Update[String](insertStatement).updateManyWithGeneratedKeys[Actor]("id", "name")(actorNames)
+    updateAction.compile.toList.transact(xa)
+
+  // type classes
+  class ActorName(val value: String):
+    override def toString = value
+
+  object ActorName:
+    given Get[ActorName] = Get[String].map(string => new ActorName(string))
+    given Put[ActorName] = Put[String].contramap(actorName => actorName.value)
+
+  def findAllActorNamesCustomClass: IO[List[ActorName]] =
+    sql"select name from actors".query[ActorName].to[List].transact(xa)
+
+  // Value types
+  case class DirectorId(id: Int)
+  case class DirectorName(name: String)
+  case class DirectorLastName(lastname: String)
+  case class Director(
+    id: DirectorId,
+    name: DirectorName,
+    lastName: DirectorLastName,
+  )
+
+  object Director:
+    given Read[Director] = Read[(Int, String, String)].map:
+      case (id, name, lastName) =>
+        Director(DirectorId(id), DirectorName(name), DirectorLastName(lastName))
+    given Write[Director] = Write[(Int, String, String)].contramap:
+      case Director(DirectorId(id), DirectorName(name), DirectorLastName(lastName)) =>
+        (id, name, lastName)
+
+  // Write large queries
+  def findMovieByTitle(title: String): IO[Option[Movie]] =
+    val statement = sql"""
+                   |SELECT m.id,
+                   |       m.title,
+                   |       m.year_of_production,
+                   |       array_agg(a.name) as actors,
+                   |       d.name
+                   |FROM movies m
+                   |JOIN movies_actors ma ON m.id = ma.movie_id
+                   |JOIN actors a ON ma.actor_id = a.id
+                   |JOIN directors d ON m.director_id = d.id
+                   |WHERE m.title = $title
+                   |GROUP BY (m.id,
+                   |          m.title,
+                   |          m.year_of_production,
+                   |          d.name,
+                   |          d.last_name)
+                   |""".stripMargin
+    statement.query[Movie].option.transact(xa)
+
+  def findMovieByTitle_v2(title: String): IO[Option[Movie]] =
+    def findMovieByTitle =
+      sql"select id, title, year_of_production, director_id, from movies where title = $title"
+        .query[(UUID, String, Int, Int)]
+        .option
+
+    def findDirectorById(directorId: Int) =
+      sql"select name, last_name from directors where id = $directorId"
+        .query[(String, String)]
+        .option
+
+    def findActorsByMovieId(movieId: UUID) =
+      sql"select a.name from actors a join movies_actors ma ON a.id = ma.actor_id where ma.movie_id = $movieId"
+        .query[String]
+        .to[List]
+
+    val query = for
+      maybeMovie <- findMovieByTitle
+      maybeDirector <- maybeMovie match
+        case Some((_, _, _, directorId)) => findDirectorById(directorId)
+        case None => Option.empty[(String, String)].pure[ConnectionIO]
+      actors <- maybeMovie match
+        case Some((movieId, _, _, _)) => findActorsByMovieId(movieId)
+        case None => List.empty[String].pure[ConnectionIO]
+    yield for
+      (id, t, year, _) <- maybeMovie
+      (firstName, lastName) <- maybeDirector
+    yield Movie(id, t, year, actors, s"$firstName, $lastName")
+
+    query.transact(xa)
+
   override def run(args: List[String]): IO[ExitCode] =
-    saveActor_v2(8, "Mary").myDebug().as(ExitCode.Success)
+    findMovieByTitle_v2("Zack Snyder's Justice League").myDebug.as(ExitCode.Success)
